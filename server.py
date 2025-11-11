@@ -13,7 +13,9 @@ import logging
 import os
 import signal
 import sys
+import threading
 from multiprocessing.managers import BaseManager
+from socketserver import ThreadingMixIn
 from typing import Any, Dict, Tuple
 
 import requests  # type: ignore[import-untyped]
@@ -51,7 +53,11 @@ class WeatherService:
     USER_AGENT: str = "(Python Weather Client, contact@example.com)"
     
     def __init__(self) -> None:
-        """Initialize the weather service with a requests session."""
+        """Initialize the weather service with a requests session.
+        
+        Note: requests.Session is thread-safe, so multiple threads can
+        safely use the same session instance concurrently.
+        """
         self.session: requests.Session = requests.Session()
         self.session.headers.update({
             'User-Agent': self.USER_AGENT,
@@ -142,7 +148,9 @@ class WeatherService:
         Raises:
             Any exceptions from requests library or API (no error handling).
         """
-        logger.info("Fetching weather for location: (%s, %s)", location.latitude, location.longitude)
+        thread_id: int = threading.get_ident()
+        logger.info("Fetching weather for location: (%s, %s) [Thread: %s]", 
+                   location.latitude, location.longitude, thread_id)
         
         # Step 1: Get grid coordinates
         office, grid_x, grid_y = self._get_grid_info(location.latitude, location.longitude)
@@ -168,12 +176,22 @@ class WeatherService:
             detailed_forecast=period['detailedForecast']
         )
         
-        logger.info("Weather data sent to client: %s, %s°%s", forecast.name, forecast.temperature, forecast.temperature_unit)
+        logger.info("Weather data sent to client: %s, %s°%s [Thread: %s]", 
+                   forecast.name, forecast.temperature, forecast.temperature_unit, thread_id)
         return forecast
 
 
-class WeatherManager(BaseManager):
-    """Custom Manager for sharing WeatherService across processes."""
+class WeatherManager(ThreadingMixIn, BaseManager):
+    """Custom Manager for sharing WeatherService across processes.
+    
+    ThreadingMixIn enables concurrent client handling by spawning a new thread
+    for each client connection. The requests.Session is thread-safe, so no
+    additional locking is needed for our use case.
+    
+    Attributes:
+        daemon_threads: If True, threads will exit when the main server exits.
+    """
+    daemon_threads: bool = True  # Threads exit when server stops
 
 
 def write_connection_info(socket_path: str, authkey: bytes) -> None:

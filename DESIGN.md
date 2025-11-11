@@ -10,10 +10,12 @@ A multiprocessing-based client-server system that fetches weather forecasts from
 - **Communication**: Manager proxy objects over Unix domain socket
 - **Socket Location**: `.weather_manager.sock` in workspace root
 - **Platform**: Unix/Linux only (no Windows support)
-- **Concurrency**: Single client request at a time (1:1 query/response)
+- **Concurrency**: Multiple concurrent clients supported via ThreadingMixIn
+- **Threading Model**: New thread spawned per client connection
+- **Thread Safety**: requests.Session is thread-safe; no locks required
 - **Location**: Client passes Location dataclass with lat/lon; Seattle hardcoded in client but server supports any location
 - **Data Format**: Structured Python dataclass (Location and WeatherForecast)
-- **Session Management**: Single `requests.Session` object created at server start and reused
+- **Session Management**: Single `requests.Session` object created at server start and reused across threads
 - **API Flow**: Two-step process - get grid coordinates from lat/lon, then fetch forecast
 
 ### 2.2 Server Requirements
@@ -32,8 +34,10 @@ A multiprocessing-based client-server system that fetches weather forecasts from
 - Connect to server via connection file
 - Create Location dataclass with hardcoded Seattle coordinates (47.6062, -122.3321)
 - Pass Location to server's `get_weather(location)` method
-- Make single weather request
-- Disconnect and exit after receiving response
+- Spawn 3 concurrent client connections to demonstrate threading
+- Time and measure concurrent performance
+- Display results from all 3 clients with timing information
+- Disconnect and exit after receiving responses
 - Crash if server not available (no connection file)
 - Format and print weather data using dataclass `to_human_readable()` method
 
@@ -270,12 +274,15 @@ class WeatherForecast:
    - `BASE_URL`: Weather.gov API base
    - `USER_AGENT`: Generic user agent string
 
-2. Custom `WeatherManager` - BaseManager subclass
+2. Custom `WeatherManager` - BaseManager subclass with ThreadingMixIn
+   - Inherits from ThreadingMixIn for concurrent client handling
    - Register `WeatherService` as `get_weather_service`
    - Create manager with Unix domain socket (`.weather_manager.sock`)
    - Delete existing socket file on startup
    - Write connection info (socket path + authkey) to JSON file
    - Start and serve forever
+   - Spawn new thread for each client connection
+   - daemon_threads=True for automatic thread cleanup
 
 3. Signal handling - Clean Ctrl+C shutdown
 
@@ -283,12 +290,15 @@ class WeatherForecast:
 
 **Key Components:**
 1. `load_connection_info()`: Read and parse JSON file to get socket path and authkey
-2. Create `Location` dataclass with Seattle coordinates (47.6062, -122.3321)
-3. Connect to manager proxy via Unix socket
-4. Get proxy reference to WeatherService
-5. Call `get_weather(location)` method
-6. Print formatted output using `to_human_readable()`
-7. Exit
+2. `fetch_weather(client_id)`: Single client connection logic with timing
+3. `main()`: Orchestrates 3 concurrent clients using ThreadPoolExecutor
+4. Create `Location` dataclass with Seattle coordinates (47.6062, -122.3321)
+5. Connect to manager proxy via Unix socket (each client independently)
+6. Get proxy reference to WeatherService
+7. Call `get_weather(location)` method
+8. Collect and display results from all 3 clients
+9. Print performance statistics (total time, speedup vs sequential)
+10. Exit
 
 ### 4.3 Shared Module (shared.py)
 
