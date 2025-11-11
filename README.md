@@ -155,6 +155,362 @@ Client                    Unix Socket                Server                     
   ├──9. Display & exit       │                         │                              │
 ```
 
+## Low-Level Communication Details
+
+This section explains how the multiprocessing Manager proxy objects communicate over Unix domain sockets at a technical level.
+
+### Manager Architecture Overview
+
+Python's `multiprocessing.managers.BaseManager` provides a way to share Python objects across processes by creating proxy objects. Here's how it works in our implementation:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Server Process                          │
+│                                                              │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  WeatherService (Actual Object)                    │    │
+│  │  - get_weather(location) method                    │    │
+│  │  - _session: requests.Session                      │    │
+│  └────────────────────────────────────────────────────┘    │
+│                          ▲                                   │
+│                          │ Direct access                     │
+│                          │                                   │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  Manager Server                                     │    │
+│  │  - Listens on .weather_manager.sock                │    │
+│  │  - Maintains registry of shared objects            │    │
+│  │  - Handles incoming RPC calls                      │    │
+│  │  - Serializes/deserializes with pickle            │    │
+│  └────────────────────────────────────────────────────┘    │
+│                          │                                   │
+└──────────────────────────┼───────────────────────────────────┘
+                           │ Unix Socket
+                           │ (.weather_manager.sock)
+┌──────────────────────────┼───────────────────────────────────┐
+│                      Client Process                          │
+│                          │                                   │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  Manager Client                                     │    │
+│  │  - Connects to .weather_manager.sock               │    │
+│  │  - Authenticates with authkey                      │    │
+│  │  - Requests proxy to WeatherService                │    │
+│  └────────────────────────────────────────────────────┘    │
+│                          │                                   │
+│                          ▼ Returns                           │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  Proxy Object (weather_service_proxy)              │    │
+│  │  - Looks like WeatherService                       │    │
+│  │  - get_weather() calls go over socket              │    │
+│  │  - Transparent RPC mechanism                       │    │
+│  └────────────────────────────────────────────────────┘    │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Connection Establishment
+
+**Step 1: Server Initialization**
+
+```python
+# Server creates Unix socket
+manager = WeatherManager(address=".weather_manager.sock", authkey=b'weather_secret')
+manager.start()
+```
+
+What happens:
+1. Manager spawns a new process (the server process)
+2. Server process creates a Unix domain socket at `.weather_manager.sock`
+3. Server binds to the socket and starts listening with `socket.listen()`
+4. Server enters accept loop, waiting for connections
+5. Socket file appears in the filesystem with permissions based on umask
+
+**Step 2: Client Connection**
+
+```python
+# Client connects to the socket
+manager = WeatherManager(address=".weather_manager.sock", authkey=b'weather_secret')
+manager.connect()
+```
+
+What happens:
+1. Client opens a Unix socket connection to `.weather_manager.sock`
+2. Performs authentication handshake using HMAC-based challenge-response:
+   - Server sends random challenge bytes
+   - Client computes `HMAC(authkey, challenge)` and sends digest
+   - Server verifies digest matches
+   - If mismatch: connection closed with `AuthenticationError`
+3. Connection established; socket remains open for duration of session
+
+### Proxy Object Mechanics
+
+**Step 3: Requesting a Proxy**
+
+```python
+# Client requests proxy to registered object
+weather_service_proxy = manager.get_weather_service()
+```
+
+What happens:
+1. Client sends RPC request over socket: `"GET_PROXY for 'get_weather_service'"`
+2. Server looks up 'get_weather_service' in its registry
+3. Server calls the registered callable: `lambda: weather_service`
+4. Server creates a unique token (ID) for this object instance
+5. Server stores mapping: `token -> actual_weather_service_object`
+6. Server sends response: `token + object_metadata`
+7. Client receives response and creates a **Proxy** object
+8. Proxy object stores: token, socket connection, method signatures
+
+**Important**: The actual `WeatherService` object **never leaves** the server process. Only a reference token is sent.
+
+### Remote Method Invocation
+
+**Step 4: Calling a Method on the Proxy**
+
+```python
+# Client calls method on proxy
+forecast = weather_service_proxy.get_weather(seattle_location)
+```
+
+What happens (detailed):
+
+**Client Side:**
+1. Proxy intercepts the method call using `__getattr__` magic method
+2. Proxy serializes the call:
+   ```python
+   message = {
+       'method': 'get_weather',
+       'args': (seattle_location,),
+       'kwargs': {},
+       'token': '<object-token>'
+   }
+   ```
+3. Serializes message with `pickle.dumps(message)`
+4. Sends pickled data over Unix socket:
+   ```
+   [4-byte length prefix][pickled message data]
+   ```
+5. Waits for response (blocking socket read)
+
+**Server Side:**
+6. Server reads 4-byte length prefix to know how much data to read
+7. Server reads the pickled message data
+8. Server deserializes with `pickle.loads()`
+9. Server looks up object using token: `obj = registry[token]`
+10. Server calls the actual method:
+    ```python
+    result = obj.get_weather(seattle_location)
+    ```
+11. Method executes (fetches weather from API, etc.)
+12. Server serializes the result:
+    ```python
+    response = {
+        'status': 'success',
+        'result': result  # WeatherForecast dataclass
+    }
+    ```
+13. Server pickles response: `pickle.dumps(response)`
+14. Server sends response over socket:
+    ```
+    [4-byte length prefix][pickled response data]
+    ```
+
+**Client Side (continued):**
+15. Client reads response from socket
+16. Client deserializes response with `pickle.loads()`
+17. Client checks status
+18. Client extracts result (WeatherForecast object)
+19. Proxy returns result to caller
+
+**Important**: The `WeatherForecast` dataclass is copied to the client process. It's not a proxy because it's a simple data container.
+
+### Unix Socket vs TCP/IP
+
+**Unix Socket Benefits in our implementation:**
+
+| Aspect | Unix Socket | TCP/IP |
+|--------|-------------|--------|
+| **Connection** | `connect("/path/to/socket")` | `connect(("127.0.0.1", port))` |
+| **Kernel path** | Direct IPC, no network stack | Full TCP/IP stack processing |
+| **Speed** | ~2x faster for local IPC | Slower (network overhead) |
+| **Buffer** | Typically 128KB socket buffer | TCP buffers + flow control |
+| **Security** | File permissions (chmod) | Port-based (firewall rules) |
+| **Discovery** | Fixed path in filesystem | Port number can conflict |
+| **Serialization** | Same (pickle) | Same (pickle) |
+
+### Authentication Flow
+
+The authkey prevents unauthorized processes from accessing the manager:
+
+```
+Client                                Server
+  |                                      |
+  |-------- Connect to socket --------->|
+  |                                      |
+  |<------- Challenge (32 bytes) -------|
+  |                                      |
+  | Compute:                             |
+  | digest = HMAC-SHA256(                |
+  |   key=authkey,                       |
+  |   msg=challenge                      |
+  | )                                    |
+  |                                      |
+  |-------- Send digest --------------->|
+  |                                      | Verify:
+  |                                      | expected = HMAC-SHA256(
+  |                                      |   key=authkey,
+  |                                      |   msg=challenge
+  |                                      | )
+  |                                      | if digest == expected:
+  |                                      |   authenticated = True
+  |                                      |
+  |<------- Success / Failure ----------|
+  |                                      |
+```
+
+Without the correct authkey, the client cannot proceed past this handshake.
+
+### Serialization Details
+
+**What gets serialized:**
+- Method calls: method name, arguments, keyword arguments
+- Return values: Complete objects (dataclasses, primitives, etc.)
+- Exceptions: If server raises exception, it's pickled and re-raised on client
+
+**Pickle Protocol:**
+- Uses Python's pickle protocol (typically protocol 4 or 5)
+- Handles complex types: classes, functions, nested structures
+- **Security note**: Pickle can execute arbitrary code, so authkey is critical
+
+**Data Flow Example:**
+
+```python
+# Client: Create Location object
+location = Location(latitude=47.6062, longitude=-122.3321)
+
+# Gets pickled into bytes (simplified):
+b'\x80\x04\x95...[binary data]...'
+
+# Sent over Unix socket
+# Server unpickles to reconstruct Location object on server side
+# Server executes: forecast = weather_service.get_weather(location)
+# Server pickles WeatherForecast result
+# Client unpickles to get the forecast object
+
+# Result: Client now has a complete WeatherForecast object (not a proxy)
+```
+
+### Why Some Objects Are Proxies and Others Aren't
+
+**Proxied Objects:**
+- `WeatherService` is proxied because:
+  - It maintains state (`requests.Session`)
+  - We want it to live only in server process
+  - Multiple clients can share the same instance
+
+**Not Proxied (Copied):**
+- `Location` dataclass is copied because:
+  - It's immutable data
+  - No state to maintain
+  - Client needs its own copy to use
+- `WeatherForecast` dataclass is copied because:
+  - It's return data
+  - Client needs complete data to display
+  - No ongoing server-side state
+
+### Performance Characteristics
+
+**Single Request Timing (approximate):**
+```
+Socket connection:        ~0.1ms   (reused across calls)
+Authentication:           ~0.5ms   (once per connection)
+Method call serialization: ~0.1ms   (pickle)
+Socket send:              ~0.05ms  (Unix socket)
+Server processing:        ~2000ms  (weather API calls)
+Response serialization:   ~0.1ms   (pickle)
+Socket receive:           ~0.05ms  (Unix socket)
+Response deserialization: ~0.1ms   (pickle)
+─────────────────────────────────
+Total overhead:           ~1ms     (everything except API)
+Total with API:           ~2001ms
+```
+
+The Unix socket overhead is negligible compared to the Weather API calls.
+
+### Connection Lifecycle
+
+```
+Server Start:
+  ├─ Create socket file
+  ├─ Bind and listen
+  └─ Wait for connections
+
+Client Connect:
+  ├─ Open socket
+  ├─ Authenticate
+  ├─ Get proxy
+  ├─ Make RPC calls (multiple)
+  ├─ Close connection
+  └─ Exit
+
+Server continues:
+  └─ Accept next connection...
+
+Server Stop (Ctrl+C):
+  ├─ Signal handler called
+  ├─ Server process exits
+  └─ Socket file remains (as designed)
+```
+
+### Thread Safety and Concurrency
+
+**Current Implementation:**
+- Server handles **one client at a time** (sequential)
+- Socket accept loop is blocking
+- No threading or async
+- Simple, deterministic behavior
+
+**If we wanted concurrency:**
+- Could use `ThreadingMixIn` or `ForkingMixIn`
+- Each client would get its own thread/process
+- Would need to handle concurrent Weather API calls
+- Our simple design intentionally avoids this complexity
+
+### Debugging Tips
+
+**See the raw socket communication:**
+
+```bash
+# Terminal 1 - Monitor socket activity
+sudo strace -e trace=read,write,connect -p <server-pid>
+
+# Terminal 2 - Run client
+python client.py
+
+# You'll see:
+# connect(3, {sa_family=AF_UNIX, sun_path=".weather_manager.sock"}, ...)
+# write(3, "\x00\x00\x00\x42...", 66) = 66    # Send request
+# read(3, "\x00\x00\x01\x23...", 4) = 4       # Read response length
+# read(3, "...", 291) = 291                    # Read response data
+```
+
+**Inspect the connection file:**
+
+```bash
+cat .manager_connection
+{
+  "socket_path": ".weather_manager.sock",
+  "authkey": "d2VhdGhlcl9zZWNyZXQ="  # base64 of b'weather_secret'
+}
+```
+
+**Check socket file:**
+
+```bash
+ls -la .weather_manager.sock
+srwxr-xr-x 1 user user 0 Nov 11 14:30 .weather_manager.sock
+# Note: 's' prefix indicates socket file
+```
+
 ### Data Structures
 
 **Location** (`shared.py`):
