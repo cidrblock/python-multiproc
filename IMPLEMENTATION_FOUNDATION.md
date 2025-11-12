@@ -22,10 +22,8 @@ This guide is for developers building the **foundational framework** of the Ansi
 2. [Directory Structure](#directory-structure)
 3. [Core Components](#core-components)
 4. [Manager Service](#manager-service)
-5. [Code Generation Tools](#code-generation-tools)
-6. [Base Action Plugin](#base-action-plugin)
-7. [Manager Startup Strategy](#manager-startup-strategy)
-8. [Testing the Foundation](#testing-the-foundation)
+5. [Manager Startup Strategy](#manager-startup-strategy)
+6. [Testing the Foundation](#testing-the-foundation)
 
 ---
 
@@ -64,7 +62,7 @@ PLAYBOOK TASK 2+ reuse same Manager (persistent connection)
 | `RPC Client` | `plugins/plugin_utils/manager/` | Client-side manager communication |
 | `Version Registry` | `plugins/plugin_utils/platform/` | Dynamic version/module discovery |
 | `Class Loader` | `plugins/plugin_utils/platform/` | Load version-specific classes |
-| `Base Action Plugin` | `plugins/action/` | Common action plugin logic |
+| `Base Action Plugin` | `plugins/action/base_action.py` | Manager spawning, validation, common logic |
 | `Generators` | `tools/generators/` | Code generation scripts |
 
 ---
@@ -80,8 +78,8 @@ ansible.platform/
 ├── plugins/
 │   ├── action/                         # Action plugins (client-side)
 │   │   ├── __init__.py
-│   │   ├── base_action.py              # Base action plugin class
-│   │   └── user.py                     # User action plugin (example)
+│   │   ├── base_action.py              # ⭐ Base action plugin class (FOUNDATION)
+│   │   └── user.py                     # User action plugin (example - inherits from base)
 │   │
 │   ├── plugin_utils/                   # Shared utilities (importable)
 │   │   ├── __init__.py
@@ -1592,116 +1590,367 @@ class ManagerRPCClient:
 
 ---
 
+### 7. Base Action Plugin
+
+**File**: `plugins/action/base_action.py`
+
+**Purpose**: Common functionality for all resource action plugins.
+
+This is the base class that all resource-specific action plugins inherit from. It provides:
+- Manager spawning/connection logic
+- Input/output validation
+- ArgumentSpec generation from DOCUMENTATION
+
+```python
+"""Base action plugin for platform resources.
+
+Provides common functionality inherited by all resource action plugins.
+"""
+
+from ansible.plugins.action import ActionBase
+from ansible.module_utils.common.arg_spec import ArgumentSpecValidator
+from ansible.errors import AnsibleError
+from pathlib import Path
+import yaml
+import logging
+import tempfile
+import secrets
+import base64
+from multiprocessing import Process
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class BaseResourceActionPlugin(ActionBase):
+    """
+    Base action plugin for all platform resources.
+    
+    Provides common functionality:
+    - Manager spawning/connection (_get_or_spawn_manager)
+    - Input/output validation (_validate_data)
+    - ArgumentSpec generation (_build_argspec_from_docs)
+    
+    Subclasses must define:
+    - MODULE_NAME: Name of the resource (e.g., 'user', 'organization')
+    - DOCUMENTATION: Module documentation string
+    - ANSIBLE_DATACLASS: The Ansible dataclass type
+    
+    Example subclass:
+        class ActionModule(BaseResourceActionPlugin):
+            MODULE_NAME = 'user'
+            
+            def run(self, tmp=None, task_vars=None):
+                # Use inherited methods
+                manager = self._get_or_spawn_manager(task_vars)
+                # ... implement resource-specific logic
+    """
+    
+    MODULE_NAME = None  # Subclass must override
+    
+    def _get_or_spawn_manager(self, task_vars: dict):
+        """
+        Get existing manager or spawn new one.
+        
+        Checks if a manager is already running (stored in hostvars).
+        If found, connects to it. If not, spawns a new manager process.
+        
+        Args:
+            task_vars: Task variables from Ansible
+        
+        Returns:
+            ManagerRPCClient instance
+        
+        Raises:
+            RuntimeError: If manager fails to start
+        """
+        # Import here to avoid circular imports
+        from ansible.plugins.plugin_utils.manager.rpc_client import ManagerRPCClient
+        
+        # Check if manager info in hostvars
+        hostvars = task_vars.get('hostvars', {})
+        inventory_hostname = task_vars.get('inventory_hostname', 'localhost')
+        host_vars = hostvars.get(inventory_hostname, {})
+        
+        socket_path = host_vars.get('platform_manager_socket')
+        authkey_b64 = host_vars.get('platform_manager_authkey')
+        gateway_url = host_vars.get('gateway_url')
+        
+        if not gateway_url:
+            raise AnsibleError(
+                "gateway_url must be defined in inventory or host_vars"
+            )
+        
+        # If manager already running, try to connect
+        if socket_path and authkey_b64 and Path(socket_path).exists():
+            try:
+                authkey = base64.b64decode(authkey_b64)
+                client = ManagerRPCClient(gateway_url, socket_path, authkey)
+                logger.info("Connected to existing manager")
+                return client
+            except Exception as e:
+                logger.warning(
+                    f"Failed to connect to existing manager: {e}. "
+                    f"Spawning new one..."
+                )
+                # Fall through to spawn new one
+        
+        # Spawn new manager
+        logger.info("Spawning new Platform Manager")
+        
+        # Generate socket path and authkey
+        socket_dir = Path(tempfile.gettempdir()) / 'ansible_platform'
+        socket_dir.mkdir(exist_ok=True)
+        socket_path = str(socket_dir / f'manager_{inventory_hostname}.sock')
+        authkey = secrets.token_bytes(32)
+        
+        # Clean up old socket if exists
+        if Path(socket_path).exists():
+            try:
+                Path(socket_path).unlink()
+            except Exception as e:
+                logger.warning(f"Failed to remove old socket: {e}")
+        
+        # Start manager process
+        def start_manager():
+            """Manager process entry point."""
+            from ansible.plugins.plugin_utils.manager.platform_manager import (
+                PlatformManager,
+                PlatformService
+            )
+            
+            # Create service
+            service = PlatformService(gateway_url)
+            
+            # Register with manager
+            PlatformManager.register(
+                'get_platform_service',
+                callable=lambda: service
+            )
+            
+            # Start manager server
+            manager = PlatformManager(address=socket_path, authkey=authkey)
+            manager.start()
+            
+            # Keep running
+            import signal
+            signal.pause()
+        
+        # Spawn process
+        process = Process(target=start_manager, daemon=True)
+        process.start()
+        
+        # Wait for socket to be created
+        max_wait = 50  # 5 seconds
+        for _ in range(max_wait):
+            if Path(socket_path).exists():
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(
+                f"Manager failed to start within {max_wait * 0.1} seconds"
+            )
+        
+        # Store info in facts for future tasks
+        authkey_b64 = base64.b64encode(authkey).decode('utf-8')
+        
+        # Set facts so subsequent tasks can reuse this manager
+        try:
+            self._execute_module(
+                module_name='ansible.builtin.set_fact',
+                module_args={
+                    'platform_manager_socket': socket_path,
+                    'platform_manager_authkey': authkey_b64,
+                    'cacheable': True  # Persist across plays
+                },
+                task_vars=task_vars
+            )
+        except Exception as e:
+            logger.warning(f"Failed to set facts: {e}")
+        
+        # Connect to newly spawned manager
+        client = ManagerRPCClient(gateway_url, socket_path, authkey)
+        logger.info(f"Spawned and connected to new manager at {socket_path}")
+        
+        return client
+    
+    def _build_argspec_from_docs(self, documentation: str) -> dict:
+        """
+        Build argument spec from DOCUMENTATION string.
+        
+        Parses the YAML documentation and converts it to Ansible's
+        ArgumentSpec format for validation.
+        
+        Args:
+            documentation: DOCUMENTATION string from module
+        
+        Returns:
+            ArgumentSpec dict suitable for ArgumentSpecValidator
+        
+        Raises:
+            ValueError: If documentation cannot be parsed
+        """
+        try:
+            doc_data = yaml.safe_load(documentation)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Failed to parse DOCUMENTATION: {e}") from e
+        
+        options = doc_data.get('options', {})
+        
+        # Build argspec in Ansible format
+        argspec = {
+            'options': options,
+            'mutually_exclusive': doc_data.get('mutually_exclusive', []),
+            'required_together': doc_data.get('required_together', []),
+            'required_one_of': doc_data.get('required_one_of', []),
+            'required_if': doc_data.get('required_if', []),
+        }
+        
+        return argspec
+    
+    def _validate_data(
+        self,
+        data: dict,
+        argspec: dict,
+        direction: str
+    ) -> dict:
+        """
+        Validate data against argument spec.
+        
+        Uses Ansible's built-in ArgumentSpecValidator to validate
+        both input (from playbook) and output (from manager).
+        
+        Args:
+            data: Data dict to validate
+            argspec: Argument specification
+            direction: 'input' or 'output' (for error messages)
+        
+        Returns:
+            Validated and normalized data dict
+        
+        Raises:
+            AnsibleError: If validation fails
+        """
+        # Create validator
+        validator = ArgumentSpecValidator(argspec)
+        
+        # Validate
+        result = validator.validate(data)
+        
+        # Check for errors
+        if result.error_messages:
+            error_msg = (
+                f"{direction.title()} validation failed: " +
+                ", ".join(result.error_messages)
+            )
+            raise AnsibleError(error_msg)
+        
+        return result.validated_parameters
+    
+    def _detect_operation(self, args: dict) -> str:
+        """
+        Detect operation type from arguments.
+        
+        Args:
+            args: Module arguments
+        
+        Returns:
+            Operation name ('create', 'update', 'delete', 'find')
+        """
+        state = args.get('state', 'present')
+        
+        if state == 'absent':
+            return 'delete'
+        elif state == 'present':
+            # Check if ID is provided (update) or not (create)
+            if args.get('id'):
+                return 'update'
+            else:
+                return 'create'
+        elif state == 'find':
+            return 'find'
+        else:
+            raise AnsibleError(f"Unknown state: {state}")
+
+
+# Example usage in resource-specific action plugin:
+#
+# from .base_action import BaseResourceActionPlugin
+# from ansible.plugins.plugin_utils.docs.user import DOCUMENTATION
+# from ansible.plugins.plugin_utils.ansible_models.user import AnsibleUser
+#
+# class ActionModule(BaseResourceActionPlugin):
+#     MODULE_NAME = 'user'
+#     
+#     def run(self, tmp=None, task_vars=None):
+#         super(ActionModule, self).run(tmp, task_vars)
+#         
+#         if task_vars is None:
+#             task_vars = {}
+#         
+#         args = self._task.args.copy()
+#         
+#         try:
+#             # 1. Validate input
+#             argspec = self._build_argspec_from_docs(DOCUMENTATION)
+#             validated_args = self._validate_data(args, argspec, 'input')
+#             
+#             # 2. Get manager
+#             manager = self._get_or_spawn_manager(task_vars)
+#             
+#             # 3. Create dataclass
+#             user_data = AnsibleUser(**validated_args)
+#             
+#             # 4. Execute
+#             operation = self._detect_operation(args)
+#             result_dict = manager.execute(operation, self.MODULE_NAME, user_data)
+#             
+#             # 5. Validate output
+#             validated_result = self._validate_data(result_dict, argspec, 'output')
+#             
+#             # 6. Return
+#             return {
+#                 'failed': False,
+#                 'changed': True,
+#                 self.MODULE_NAME: validated_result
+#             }
+#         except Exception as e:
+#             return {'failed': True, 'msg': str(e)}
+```
+
+**Key Features**:
+- Manager lifecycle management (spawn once, reuse)
+- Bidirectional validation (input and output)
+- Fact caching for manager connection info
+- Error handling and logging
+- Template for resource-specific action plugins
+
+**Usage by Resource Action Plugins**:
+
+Resource-specific action plugins only need to:
+1. Inherit from `BaseResourceActionPlugin`
+2. Set `MODULE_NAME`
+3. Import their DOCUMENTATION and dataclass
+4. Implement a thin `run()` method that uses inherited helpers
+
+See `IMPLEMENTATION_FEATURES.md` for complete examples.
+
+---
+
 ## Manager Startup Strategy
 
-### 7. Manager Spawning from Action Plugin
+### 8. Manager Lifecycle
 
 **Concept**: The first playbook task spawns the manager if not already running. Subsequent tasks reuse the same manager.
 
-**Implementation in Base Action Plugin**:
+**Flow**:
+1. First task calls `_get_or_spawn_manager()` (from `BaseResourceActionPlugin`)
+2. No manager exists → spawns new manager process
+3. Sets facts (`platform_manager_socket`, `platform_manager_authkey`)
+4. Returns `ManagerRPCClient` connected to new manager
+5. Subsequent tasks call `_get_or_spawn_manager()` → finds existing manager in facts → reuses it
 
-```python
-def _get_or_spawn_manager(
-    self,
-    task_vars: dict
-) -> ManagerRPCClient:
-    """
-    Get existing manager or spawn new one.
-    
-    Args:
-        task_vars: Task variables from Ansible
-    
-    Returns:
-        ManagerRPCClient instance
-    """
-    # Check if manager info in hostvars
-    hostvars = task_vars.get('hostvars', {})
-    inventory_hostname = task_vars.get('inventory_hostname')
-    host_vars = hostvars.get(inventory_hostname, {})
-    
-    socket_path = host_vars.get('platform_manager_socket')
-    authkey_b64 = host_vars.get('platform_manager_authkey')
-    gateway_url = host_vars.get('gateway_url')
-    
-    # If manager already running, connect
-    if socket_path and authkey_b64 and Path(socket_path).exists():
-        import base64
-        authkey = base64.b64decode(authkey_b64)
-        
-        try:
-            client = ManagerRPCClient(gateway_url, socket_path, authkey)
-            logger.info("Connected to existing manager")
-            return client
-        except Exception as e:
-            logger.warning(f"Failed to connect to existing manager: {e}")
-            # Fall through to spawn new one
-    
-    # Spawn new manager
-    logger.info("Spawning new Platform Manager")
-    
-    # Generate socket path and authkey
-    import tempfile
-    import secrets
-    import base64
-    from multiprocessing import Process
-    
-    socket_dir = Path(tempfile.gettempdir()) / 'ansible_platform'
-    socket_dir.mkdir(exist_ok=True)
-    socket_path = str(socket_dir / f'manager_{inventory_hostname}.sock')
-    authkey = secrets.token_bytes(32)
-    
-    # Clean up old socket if exists
-    if Path(socket_path).exists():
-        Path(socket_path).unlink()
-    
-    # Start manager process
-    def start_manager():
-        from .platform_manager import PlatformManager, PlatformService
-        
-        service = PlatformService(gateway_url)
-        PlatformManager.register(
-            'get_platform_service',
-            callable=lambda: service
-        )
-        
-        manager = PlatformManager(address=socket_path, authkey=authkey)
-        manager.start()
-        
-        # Keep running
-        import signal
-        signal.pause()
-    
-    process = Process(target=start_manager, daemon=True)
-    process.start()
-    
-    # Wait for socket to be created
-    import time
-    for _ in range(50):  # Wait up to 5 seconds
-        if Path(socket_path).exists():
-            break
-        time.sleep(0.1)
-    else:
-        raise RuntimeError("Manager failed to start")
-    
-    # Store info in task vars (will be saved to hostvars)
-    authkey_b64 = base64.b64encode(authkey).decode('utf-8')
-    
-    # Set facts for future tasks
-    self._execute_module(
-        module_name='ansible.builtin.set_fact',
-        module_args={
-            'platform_manager_socket': socket_path,
-            'platform_manager_authkey': authkey_b64
-        },
-        task_vars=task_vars
-    )
-    
-    # Connect
-    client = ManagerRPCClient(gateway_url, socket_path, authkey)
-    logger.info(f"Spawned and connected to new manager at {socket_path}")
-    
-    return client
-```
+See **Section 7: Base Action Plugin** above for complete `_get_or_spawn_manager()` implementation.
 
 **Inventory Setup**:
 
@@ -1796,7 +2045,8 @@ The foundation provides:
 ✅ **DynamicClassLoader** - Load version-specific classes  
 ✅ **PlatformManager** - Persistent service (generic, resource-agnostic)  
 ✅ **ManagerRPCClient** - Client-side communication  
-✅ **Manager Spawning** - First task spawns, others reuse  
+✅ **BaseResourceActionPlugin** - Common action plugin functionality  
+✅ **Manager Lifecycle** - First task spawns, others reuse  
 
 **All components are generic and work for ANY resource module.**
 
